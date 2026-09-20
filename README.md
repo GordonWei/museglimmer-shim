@@ -49,11 +49,18 @@ The model is chosen by the `MUSEGLIMMER_MODEL` environment variable (defaults to
 
 ## API
 
-- `POST /v1/chat/completions` — `{model, messages, max_tokens, temperature}` in, standard `{choices: [{message: {role, content}}], usage: {...}}` out.
+- `POST /v1/chat/completions` — `{model, messages, max_tokens, temperature, tools, stream}` in, standard OpenAI chat-completion shape out (`choices[].message.content` / `.tool_calls`, or SSE chunks when `stream: true`).
+  - **Tool calling**: pass `tools` in OpenAI's function-calling shape and this shim gets Muse Glimmer's chat template to inject its own tool-calling syntax (an XML-ish `<atem:function_calls>` block, not the OpenAI/Anthropic convention — this shim parses it and translates it into a standard `tool_calls` response). Without `tools` declared, the model still emits its internal routing tokens (`to=self<|message|>...`) but has no idea what syntax to use if it decides to call something anyway, producing garbled output — always pass `tools` if the caller might want the model to use one.
+  - **Images**: pass OpenAI-shaped vision content (`{"type": "image_url", "image_url": {"url": "..."}}` — a `data:` URI, a plain URL, or a local file path all work) mixed into a message's `content` list. Muse Glimmer is a genuine vision-language model (confirmed via its `config.json`'s `vision_config`/`image_token_id`), not text-only — it sees the actual image, not a caption from some other model.
+  - **Streaming matters more than it looks like it should**: some clients (confirmed with Clawdbot) treat a slow *non-streaming* response as indistinguishable from a stalled connection and abort+retry it after a fixed idle window, regardless of any configured request timeout — because from the client's side, zero bytes arrive until the whole completion is done, either way. `stream: true` gets this shim to emit periodic heartbeat SSE frames while generating, which is enough to keep such a client from giving up on a genuinely-still-working, just-slow request.
 - `GET /v1/models` — for clients that probe available models before use.
 - `GET /health` — `{status, model, loaded}`.
 
-Generation is serialized behind a single lock: MLX/Metal state isn't safe to hit concurrently from multiple threads, and this is meant for one user's own tools, not a multi-tenant service.
+Generation is serialized behind a single lock: MLX/Metal state isn't safe to hit concurrently from multiple threads, and this is meant for one user's own tools, not a multi-tenant service. One consequence worth knowing: if a client aborts its own HTTP request (its own timeout, a retry), this shim has no way to know that and keeps generating anyway — the next request just queues behind it until it finishes, however long that takes.
+
+## A real limitation, not a bug: full-agent-context latency
+
+Feeding this a short, self-contained prompt (a summarization task, a single question) is fast enough for interactive use — tens of seconds. Feeding it a prompt that carries a large fixed system-prompt overhead (a full agent framework's tool/skill definitions — tens of thousands of tokens before the user's actual message even starts) routinely pushes single-request latency past 300–400 seconds on an M-series Mac, because that overhead has to be processed on every single turn regardless of how simple the user's actual question is. That's model-speed math, not something this shim can paper over: a 30B model at ~13–15 tok/s just needs that long to get through that much prompt. If the client you're pointing this at has its own "has this been silent too long" abort logic on top of (not just) an overall request timeout, budget for it — this genuinely can take longer than a fast cloud model would, on every turn, once a large fixed prompt is in the mix.
 
 ## Real usage
 
