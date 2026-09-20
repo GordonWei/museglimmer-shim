@@ -1,0 +1,3 @@
+mlx_vlm==0.7.1
+fastapi
+uvicorn
