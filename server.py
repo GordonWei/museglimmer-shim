@@ -44,6 +44,16 @@ MODEL_ID = os.environ.get("MUSEGLIMMER_MODEL", "mlx-community/Muse-Glimmer-30B-4
 _generate_lock = threading.Lock()
 _state: dict = {}
 
+# Reject instead of queue when a generation is already running. With the
+# lock above, a second caller just waits — and one Clawdbot request (~22k
+# prompt tokens of tool definitions) holds the model for 5+ minutes, so
+# victoria-gateway's alert summary sits in that queue until its own timeout
+# and only then falls back to the cloud. A fast 503 lets it fall back right
+# away (it treats 5xx/429 as "backend unavailable"; 4xx would be a hard
+# error). Set MUSEGLIMMER_REJECT_WHEN_BUSY=0 to get the old queueing back.
+REJECT_WHEN_BUSY = os.environ.get("MUSEGLIMMER_REJECT_WHEN_BUSY", "1") != "0"
+BUSY_RETRY_AFTER_S = 30
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -362,6 +372,15 @@ async def _stream_chat_completions(
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # Best-effort check, not a reservation: two requests arriving in the same
+    # instant can both pass it, and the lock still serializes them.
+    if REJECT_WHEN_BUSY and _generate_lock.locked():
+        log.info("busy, rejecting request with 503")
+        return JSONResponse(
+            {"error": {"message": "model is busy with another request", "type": "server_busy"}},
+            status_code=503,
+            headers={"Retry-After": str(BUSY_RETRY_AFTER_S)},
+        )
     body = await request.json()
     prompt, images = _build_prompt(body)
     model = _state["model"]

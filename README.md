@@ -56,7 +56,9 @@ The model is chosen by the `MUSEGLIMMER_MODEL` environment variable (defaults to
 - `GET /v1/models` — for clients that probe available models before use.
 - `GET /health` — `{status, model, loaded}`.
 
-Generation is serialized behind a single lock: MLX/Metal state isn't safe to hit concurrently from multiple threads, and this is meant for one user's own tools, not a multi-tenant service. One consequence worth knowing: if a client aborts its own HTTP request (its own timeout, a retry), this shim has no way to know that and keeps generating anyway — the next request just queues behind it until it finishes, however long that takes.
+Generation is serialized behind a single lock: MLX/Metal state isn't safe to hit concurrently from multiple threads, and this is meant for one user's own tools, not a multi-tenant service. One consequence worth knowing: if a client aborts its own HTTP request (its own timeout, a retry), this shim has no way to know that and keeps generating anyway — the next request would queue behind it until it finishes, however long that takes.
+
+So by default the shim doesn't queue: a request that arrives while another generation is running gets an immediate `503` with `Retry-After: 30`. I run a gateway and an agent against the same shim, and one agent request with ~22k tokens of tool definitions holds the model for 5+ minutes; the gateway's alert summary used to sit behind it until its own timeout. A `503` reads as "backend unavailable" to most OpenAI-compatible clients with fallbacks, so the caller moves on right away instead. Set `MUSEGLIMMER_REJECT_WHEN_BUSY=0` if you'd rather have the old queueing.
 
 ## A real limitation, not a bug: full-agent-context latency
 
