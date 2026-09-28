@@ -54,6 +54,12 @@ _state: dict = {}
 REJECT_WHEN_BUSY = os.environ.get("MUSEGLIMMER_REJECT_WHEN_BUSY", "1") != "0"
 BUSY_RETRY_AFTER_S = 30
 
+# Hard ceiling on one generation. Under memory pressure this model has run at
+# 1-4 tok/s, and a caller that has long since given up still holds the lock
+# (and gets everyone else a 503) until the generation finishes. Checked between
+# tokens, so it can't cut a single long prefill short.
+MAX_GENERATION_S = float(os.environ.get("MUSEGLIMMER_MAX_GENERATION_S", "900"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -210,34 +216,83 @@ def _build_prompt(body: dict) -> tuple[str, list[str]]:
     return prompt, images
 
 
-def _generate_once(model, processor, prompt: str, images: list[str], max_tokens: int, temperature: float):
+class _Generation:
+    """What one generation produced, plus why it stopped early (if it did)."""
+
+    def __init__(self, text: str, last, stopped: str | None):
+        self.text = text
+        self.prompt_tokens = last.prompt_tokens if last is not None else 0
+        self.generation_tokens = last.generation_tokens if last is not None else 0
+        self.total_tokens = self.prompt_tokens + self.generation_tokens
+        self.stopped = stopped  # None, "client_gone" or "time_limit"
+
+
+def _generate_once(
+    model, processor, prompt: str, images: list[str], max_tokens: int, temperature: float, cancel: threading.Event
+) -> _Generation:
+    # Always token-by-token, even for non-streaming requests: it's the only
+    # place we get control back between tokens, which is what lets a caller
+    # that disconnected (or a generation that ran past MAX_GENERATION_S)
+    # release the lock without killing a thread mid-Metal-call.
     with _generate_lock:
         t0 = time.time()
-        result = generate(
-            model,
-            processor,
-            prompt,
-            image=images or None,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            verbose=False,
-        )
+        deadline = t0 + MAX_GENERATION_S
+        # Each chunk's .text is only the incremental delta for that step
+        # (verified directly: the LAST chunk alone is a fragment like
+        # " instruction:", not the full reply) — has to be concatenated to
+        # reconstruct the full generation. Only the last chunk's stats fields
+        # (generation_tokens etc.) are cumulative.
+        text = ""
+        last = None
+        stopped = None
+        for chunk in stream_generate(
+            model, processor, prompt, image=images or None, max_tokens=max_tokens, temperature=temperature
+        ):
+            text += chunk.text
+            last = chunk
+            if cancel.is_set():
+                stopped = "client_gone"
+                break
+            if time.time() > deadline:
+                stopped = "time_limit"
+                break
         elapsed = time.time() - t0
-        log.info(
-            "generated %d tokens in %.1fs (%.1f tok/s), prompt_tokens=%d, images=%d",
-            result.generation_tokens,
-            elapsed,
-            result.generation_tps,
-            result.prompt_tokens,
-            len(images),
-        )
-        return result
+        if last is not None:
+            log.info(
+                "generated %d tokens in %.1fs (%.1f tok/s), prompt_tokens=%d, images=%d%s",
+                last.generation_tokens,
+                elapsed,
+                last.generation_tps,
+                last.prompt_tokens,
+                len(images),
+                f", stopped early: {stopped}" if stopped else "",
+            )
+        return _Generation(text, last, stopped)
+
+
+async def _run_generation(model, processor, prompt, images, max_tokens, temperature, cancel, request=None):
+    """Run one generation in a worker thread; flag it cancelled if the caller goes away."""
+    task = asyncio.ensure_future(
+        anyio.to_thread.run_sync(_generate_once, model, processor, prompt, images, max_tokens, temperature, cancel)
+    )
+    try:
+        while not task.done():
+            # Non-streaming clients don't cancel the handler when they hang
+            # up, so poll for it; streaming ones are handled in _body().
+            if request is not None and await request.is_disconnected():
+                log.info("client disconnected, stopping generation")
+                cancel.set()
+            await asyncio.wait({task}, timeout=1)
+        return task.result()
+    finally:
+        if not task.done():
+            cancel.set()
 
 
 async def _generate_with_empty_retry(
-    model, processor, prompt: str, images: list[str], max_tokens: int, temperature: float
+    model, processor, prompt: str, images: list[str], max_tokens: int, temperature: float, cancel, request=None
 ):
-    result = await anyio.to_thread.run_sync(_generate_once, model, processor, prompt, images, max_tokens, temperature)
+    result = await _run_generation(model, processor, prompt, images, max_tokens, temperature, cancel, request)
     content, tool_calls = _parse_model_output(result.text)
 
     # Muse Glimmer always opens with a "to=self" reasoning segment before
@@ -252,12 +307,10 @@ async def _generate_with_empty_retry(
     # finish_reason=length, indistinguishable from a genuine empty
     # response. One retry (same bet victoria-gateway's
     # chatWithEmptyReplyRetry already makes) is cheap insurance against
-    # exactly that.
-    if not content and not tool_calls:
+    # exactly that. Not worth it if the first try was stopped early.
+    if not content and not tool_calls and result.stopped is None:
         log.info("empty reply after self-reasoning consumed the token budget, retrying once")
-        result = await anyio.to_thread.run_sync(
-            _generate_once, model, processor, prompt, images, max_tokens, temperature
-        )
+        result = await _run_generation(model, processor, prompt, images, max_tokens, temperature, cancel, request)
         content, tool_calls = _parse_model_output(result.text)
 
     return result, content, tool_calls
@@ -300,68 +353,63 @@ _HEARTBEAT_INTERVAL_S = 10
 async def _stream_chat_completions(
     model, processor, prompt: str, images: list[str], max_tokens: int, temperature: float
 ):
-    result_holder: dict = {}
-
-    def _run_stream():
-        with _generate_lock:
-            t0 = time.time()
-            # Each chunk's .text is only the incremental delta for that
-            # step (verified directly: the LAST chunk alone is a fragment
-            # like " instruction:", not the full reply) — has to be
-            # concatenated to reconstruct the full generation. Only the
-            # last chunk's stats fields (generation_tokens etc.) are
-            # cumulative.
-            full_text = ""
-            last = None
-            for chunk in stream_generate(
-                model, processor, prompt, image=images or None, max_tokens=max_tokens, temperature=temperature
-            ):
-                full_text += chunk.text
-                last = chunk
-            elapsed = time.time() - t0
-            if last is not None:
-                log.info(
-                    "generated %d tokens in %.1fs (%.1f tok/s), prompt_tokens=%d",
-                    last.generation_tokens,
-                    elapsed,
-                    last.generation_tps,
-                    last.prompt_tokens,
-                )
-            result_holder["result"] = last
-            result_holder["text"] = full_text
+    cancel = threading.Event()
 
     def sse(obj: dict) -> bytes:
         return f"data: {json.dumps(obj)}\n\n".encode()
 
     base = {"id": "museglimmer-shim", "object": "chat.completion.chunk", "model": MODEL_ID}
 
+    async def _generate_with_heartbeats():
+        task = asyncio.ensure_future(
+            anyio.to_thread.run_sync(_generate_once, model, processor, prompt, images, max_tokens, temperature, cancel)
+        )
+        try:
+            while not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=_HEARTBEAT_INTERVAL_S)
+                except asyncio.TimeoutError:
+                    yield None
+        finally:
+            # Client hung up mid-stream (Starlette cancels this generator):
+            # stop the worker between tokens so it releases the lock.
+            if not task.done():
+                log.info("client disconnected, stopping generation (stream)")
+                cancel.set()
+        yield await task
+
     async def _body():
+        try:
+            async for frame in _frames():
+                yield frame
+        finally:
+            # Belt and braces: when Starlette cancels this generator the inner
+            # one isn't guaranteed to be closed right away, so flag it here too.
+            # Harmless after a normal finish (nothing is generating any more).
+            cancel.set()
+
+    async def _frames():
         yield sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
 
-        task = asyncio.ensure_future(anyio.to_thread.run_sync(_run_stream))
-        while not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=_HEARTBEAT_INTERVAL_S)
-            except asyncio.TimeoutError:
+        result = None
+        async for item in _generate_with_heartbeats():
+            if item is None:
                 yield sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": None}]})
-        await task
-
-        raw_text = result_holder.get("text", "")
-        content, tool_calls = _parse_model_output(raw_text)
-        if not content and not tool_calls:
+            else:
+                result = item
+        content, tool_calls = _parse_model_output(result.text)
+        if not content and not tool_calls and result.stopped is None:
             log.info("empty reply after self-reasoning consumed the token budget (stream), retrying once")
-            result_holder.clear()
-            retry_task = asyncio.ensure_future(anyio.to_thread.run_sync(_run_stream))
-            while not retry_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(retry_task), timeout=_HEARTBEAT_INTERVAL_S)
-                except asyncio.TimeoutError:
+            async for item in _generate_with_heartbeats():
+                if item is None:
                     yield sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": None}]})
-            await retry_task
-            raw_text = result_holder.get("text", "")
-            content, tool_calls = _parse_model_output(raw_text)
+                else:
+                    result = item
+            content, tool_calls = _parse_model_output(result.text)
 
         message, finish_reason = _build_message(content, tool_calls)
+        if result.stopped == "time_limit":
+            finish_reason = "length"
         delta = {k: v for k, v in message.items() if k != "role"}
         yield sse({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
         yield sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]})
@@ -393,8 +441,14 @@ async def chat_completions(request: Request):
         return await _stream_chat_completions(model, processor, prompt, images, max_tokens, temperature)
 
     result, content, tool_calls = await _generate_with_empty_retry(
-        model, processor, prompt, images, max_tokens, temperature
+        model, processor, prompt, images, max_tokens, temperature, threading.Event(), request
     )
+    if result.stopped == "time_limit":
+        # 5xx so callers with a fallback (victoria-gateway) move on to it.
+        return JSONResponse(
+            {"error": {"message": f"generation exceeded {MAX_GENERATION_S:.0f}s", "type": "timeout"}},
+            status_code=504,
+        )
     message, finish_reason = _build_message(content, tool_calls)
 
     return JSONResponse(

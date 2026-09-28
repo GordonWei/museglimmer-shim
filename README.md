@@ -60,6 +60,13 @@ Generation is serialized behind a single lock: MLX/Metal state isn't safe to hit
 
 So by default the shim doesn't queue: a request that arrives while another generation is running gets an immediate `503` with `Retry-After: 30`. I run a gateway and an agent against the same shim, and one agent request with ~22k tokens of tool definitions holds the model for 5+ minutes; the gateway's alert summary used to sit behind it until its own timeout. A `503` reads as "backend unavailable" to most OpenAI-compatible clients with fallbacks, so the caller moves on right away instead. Set `MUSEGLIMMER_REJECT_WHEN_BUSY=0` if you'd rather have the old queueing.
 
+The 503 only helps if the lock gets released when nobody wants the result any more, so generation runs token by token (for non-streaming requests too) and checks between tokens:
+
+- **The client went away** — it hung up, hit its own timeout, or its agent run was aborted. Before this, the shim had no way to know and kept generating for minutes while everyone else got 503s. Now it stops within a token or so.
+- **It's been running too long** — `MUSEGLIMMER_MAX_GENERATION_S` (default 900). Non-streaming requests get a `504`, streaming ones end with `finish_reason: length`.
+
+Neither check can interrupt a single long prefill: a 20k-token prompt is one big evaluation before the first token comes out, and nothing gets a say until it finishes.
+
 ## A real limitation, not a bug: full-agent-context latency
 
 Feeding this a short, self-contained prompt (a summarization task, a single question) is fast enough for interactive use — tens of seconds. Feeding it a prompt that carries a large fixed system-prompt overhead (a full agent framework's tool/skill definitions — tens of thousands of tokens before the user's actual message even starts) routinely pushes single-request latency past 300–400 seconds on an M-series Mac, because that overhead has to be processed on every single turn regardless of how simple the user's actual question is. That's model-speed math, not something this shim can paper over: a 30B model at ~13–15 tok/s just needs that long to get through that much prompt. If the client you're pointing this at has its own "has this been silent too long" abort logic on top of (not just) an overall request timeout, budget for it — this genuinely can take longer than a fast cloud model would, on every turn, once a large fixed prompt is in the mix.
