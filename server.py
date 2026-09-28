@@ -213,7 +213,40 @@ def _build_prompt(body: dict) -> tuple[str, list[str]]:
     # it's a silent no-op. Left out rather than kept as dead cargo-culted
     # code.)
     prompt = tokenizer.apply_chat_template(flat_messages, tools=tools, add_generation_prompt=True, tokenize=False)
+    _log_prompt_breakdown(tokenizer, prompt, flat_messages, tools)
     return prompt, images
+
+
+# Prefill is the slow part here (~60 tok/s under memory pressure), so a big
+# prompt is minutes of silence before the first token. When one shows up, log
+# where the tokens actually went, so there's something to trim.
+_BREAKDOWN_THRESHOLD_TOKENS = 8000
+
+
+def _log_prompt_breakdown(tokenizer, prompt: str, messages: list[dict], tools) -> None:
+    def count(text: str) -> int:
+        return len(tokenizer.encode(text))
+
+    total = count(prompt)
+    if total < _BREAKDOWN_THRESHOLD_TOKENS:
+        return
+    by_role: dict[str, int] = {}
+    for m in messages:
+        content = m.get("content")
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        by_role[m.get("role", "?")] = by_role.get(m.get("role", "?"), 0) + count(text or "")
+    tool_sizes = sorted(
+        ((t.get("function", t).get("name", "?"), count(json.dumps(t, ensure_ascii=False))) for t in (tools or [])),
+        key=lambda x: -x[1],
+    )
+    log.info(
+        "large prompt: %d tokens; messages by role %s; %d tools = %d tokens; tools %s",
+        total,
+        by_role,
+        len(tool_sizes),
+        sum(n for _, n in tool_sizes),
+        tool_sizes,
+    )
 
 
 class _Generation:
