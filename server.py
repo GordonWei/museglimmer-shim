@@ -54,6 +54,12 @@ _state: dict = {}
 REJECT_WHEN_BUSY = os.environ.get("MUSEGLIMMER_REJECT_WHEN_BUSY", "1") != "0"
 BUSY_RETRY_AFTER_S = 30
 
+# Refuse oversized prompts up front. Prefill can't be interrupted, so a 77k
+# token prompt (a bloated agent session) kept the model busy for 18 minutes
+# and every other caller got a 503. A 400 with context_length_exceeded lets
+# the caller compact/reset instead. 0 disables the check.
+MAX_PROMPT_TOKENS = int(os.environ.get("MUSEGLIMMER_MAX_PROMPT_TOKENS", "32000"))
+
 # Hard ceiling on one generation. Under memory pressure this model has run at
 # 1-4 tok/s, and a caller that has long since given up still holds the lock
 # (and gets everyone else a 503) until the generation finishes. Checked between
@@ -464,6 +470,17 @@ async def chat_completions(request: Request):
         )
     body = await request.json()
     prompt, images = _build_prompt(body)
+    if MAX_PROMPT_TOKENS:
+        tok = getattr(_state["processor"], "tokenizer", _state["processor"])
+        n_prompt = len(tok.encode(prompt))
+        if n_prompt > MAX_PROMPT_TOKENS:
+            log.info("prompt too large (%d > %d tokens), rejecting with 400", n_prompt, MAX_PROMPT_TOKENS)
+            return JSONResponse(
+                {"error": {
+                    "message": f"This model's maximum context length is {MAX_PROMPT_TOKENS} tokens; the prompt has {n_prompt}.",
+                    "type": "invalid_request_error", "code": "context_length_exceeded"}},
+                status_code=400,
+            )
     model = _state["model"]
     processor = _state["processor"]
 

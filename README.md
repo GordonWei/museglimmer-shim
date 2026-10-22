@@ -67,6 +67,8 @@ The 503 only helps if the lock gets released when nobody wants the result any mo
 
 Neither check can interrupt a single long prefill: a 20k-token prompt is one big evaluation before the first token comes out, and nothing gets a say until it finishes.
 
+So prompts over `MUSEGLIMMER_MAX_PROMPT_TOKENS` (default 32000) are refused before generation starts, with a `400` and `code: context_length_exceeded` — the same error OpenAI returns, so agent frameworks that compact or reset their session on it do that instead of retrying. A bloated 77k-token agent session once held the model for 18 minutes this way. Set it to `0` to turn the check off.
+
 ## A real limitation, not a bug: full-agent-context latency
 
 Feeding this a short, self-contained prompt (a summarization task, a single question) is fast enough for interactive use — tens of seconds. Feeding it a prompt that carries a large fixed system-prompt overhead (a full agent framework's tool/skill definitions — tens of thousands of tokens before the user's actual message even starts) routinely pushes single-request latency past 300–400 seconds on an M-series Mac, because that overhead has to be processed on every single turn regardless of how simple the user's actual question is. That's model-speed math, not something this shim can paper over: a 30B model at ~13–15 tok/s just needs that long to get through that much prompt. If the client you're pointing this at has its own "has this been silent too long" abort logic on top of (not just) an overall request timeout, budget for it — this genuinely can take longer than a fast cloud model would, on every turn, once a large fixed prompt is in the mix.
